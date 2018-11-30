@@ -150,7 +150,7 @@ class Microphone(AudioSource):
     @staticmethod
     def list_all_devices():
         with noalsaerr():
-            audio = self.pyaudio_import.PyAudio()
+            audio =  Microphone.get_pyaudio().PyAudio()
         for i in range(audio.get_device_count()):
             device_info = audio.get_device_info_by_index(i)
             print('{0}, {1}'.format(i, device_info.get("name"))  )
@@ -406,6 +406,7 @@ class AudioData(object):
         self.frame_data = frame_data
         self.sample_rate = sample_rate
         self.sample_width = int(sample_width)
+        self.num_frames = 0
 
     def get_segment(self, start_ms=None, end_ms=None):
         """
@@ -489,10 +490,10 @@ class AudioData(object):
                 wav_writer.setnchannels(1)
                 wav_writer.writeframes(raw_data)
                 wav_data = wav_file.getvalue()
-                num_frames = wav_writer.getnframes()
+                self.num_frames = wav_writer.getnframes()
             finally:  # make sure resources are cleaned up
                 wav_writer.close()
-        return wav_data, num_frames
+        return wav_data
 
     def get_aiff_data(self, convert_rate=None, convert_width=None):
         """
@@ -564,8 +565,8 @@ class AudioData(object):
 
     def get_unpacked_data(self, wav_data=None, num_frames=None):
         if wav_data is None or num_frames is None:
-            wav_data, num_frames = self.get_wav_data()
-        return struct.unpack_from('<%dh' % num_frames, wav_data)
+            wav_data = self.get_wav_data()
+        return struct.unpack_from('<%dh' % self.num_frames, wav_data)
 
     def save_wav_file(self, file_name):
         with open("{0}.wav".format(file_name), "wb") as f:
@@ -1617,7 +1618,7 @@ WavFile = AudioFile  # WavFile was renamed to AudioFile in 3.4.1
 
 
 def recognize_api(self, audio_data, client_access_token, language="en", session_id=None, show_all=False):
-    wav_data = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
+    wav_data  = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
     url = "https://api.api.ai/v1/query"
     while True:
         boundary = uuid.uuid4().hex
