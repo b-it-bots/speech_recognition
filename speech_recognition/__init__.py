@@ -20,10 +20,32 @@ import hashlib
 import hmac
 import time
 import uuid
+import struct
+import numpy as np
+import webrtcvad
+from ctypes import *
+from contextlib import contextmanager
 
 __author__ = "Anthony Zhang (Uberi)"
 __version__ = "3.8.1"
 __license__ = "BSD"
+
+"""
+Ugly way of handling alsa errors.
+"""
+ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
+
+def py_error_handler(filename, line, function, err, fmt):
+	pass
+
+c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
+
+@contextmanager
+def noalsaerr():
+	asound = cdll.LoadLibrary('libasound.so')
+	asound.snd_lib_error_set_handler(c_error_handler)
+	yield
+	asound.snd_lib_error_set_handler(None)
 
 try:  # attempt to use the Python 2 modules
     from urllib import urlencode
@@ -70,22 +92,35 @@ class Microphone(AudioSource):
 
     Higher ``chunk_size`` values help avoid triggering on rapidly changing ambient noise, but also makes detection less sensitive. This value, generally, should be left at its default.
     """
-    def __init__(self, device_index=None, sample_rate=None, chunk_size=1024):
+    def __init__(self, device_index=None, device_name=['default'], \
+                 sample_rate=16000, chunk_size=640):
         assert device_index is None or isinstance(device_index, int), "Device index must be None or an integer"
+        if not all(isinstance(dn, str) for dn in device_name):
+            raise AssertionError("Device name must be a string or a list of strings")
         assert sample_rate is None or (isinstance(sample_rate, int) and sample_rate > 0), "Sample rate must be None or a positive integer"
         assert isinstance(chunk_size, int) and chunk_size > 0, "Chunk size must be a positive integer"
 
         # set up PyAudio
         self.pyaudio_module = self.get_pyaudio()
-        audio = self.pyaudio_module.PyAudio()
+        with noalsaerr():
+            audio = self.pyaudio_module.PyAudio()
+        self.device_count = audio.get_device_count()
         try:
-            count = audio.get_device_count()  # obtain device count
-            if device_index is not None:  # ensure device index is in range
-                assert 0 <= device_index < count, "Device index out of range ({} devices available; device index should be between 0 and {} inclusive)".format(count, count - 1)
-            if sample_rate is None:  # automatically set the sample rate to the hardware's default sample rate if not specified
-                device_info = audio.get_device_info_by_index(device_index) if device_index is not None else audio.get_default_input_device_info()
-                assert isinstance(device_info.get("defaultSampleRate"), (float, int)) and device_info["defaultSampleRate"] > 0, "Invalid device info returned from PyAudio: {}".format(device_info)
-                sample_rate = int(device_info["defaultSampleRate"])
+            if device_index is not None:
+                assert 0 <= device_index <= self.device_count, "Device index out of range \
+                    ({} devices available; device index should be between 0 and {} inclusive)" \
+                        .format(count, count - 1)
+            else:
+                device_index = self.find_device(device_name)
+			# automatically set the sample rate to the hardware's default rate if not specified
+            if sample_rate is None:
+                self.device_info = audio.get_device_info_by_index(device_index) \
+                    if device_index is not None else audio.get_default_input_device_info()
+                assert isinstance(self.device_info.get("defaultSampleRate"), (float, int)) and \
+                self.device_info["defaultSampleRate"] > 0, \
+                    "Invalid device info returned from PyAudio: {}".format(device_info)
+                sample_rate = int(self.device_info["defaultSampleRate"])
+                print('{0}'.format(self.device_info.get("name")) )
         finally:
             audio.terminate()
 
@@ -111,6 +146,36 @@ class Microphone(AudioSource):
         if LooseVersion(pyaudio.__version__) < LooseVersion("0.2.11"):
             raise AttributeError("PyAudio 0.2.11 or later is required (found version {})".format(pyaudio.__version__))
         return pyaudio
+
+    @staticmethod
+    def list_all_devices():
+        with noalsaerr():
+            audio =  Microphone.get_pyaudio().PyAudio()
+        for i in range(audio.get_device_count()):
+            device_info = audio.get_device_info_by_index(i)
+            print('{0}, {1}'.format(i, device_info.get("name"))  )
+
+    @staticmethod
+    def find_device(tags):
+        """
+        Find an audio device to read input from, based on the device name.
+        """
+        with noalsaerr():
+            audio = Microphone.get_pyaudio().PyAudio()
+        device_index = None
+        for i in range(audio.get_device_count()):
+            device_info = audio.get_device_info_by_index(i)
+            # print("Device %d: %s" % (i, device_info["name"]))
+            for keyword in tags:
+                if keyword in device_info["name"].lower():
+                    # print("Found an input: device %d - %s"%(i, device_info["name"]))
+                    device_index = i
+                    return device_index
+
+        if device_index is None:
+            print("No preferred input found; using default input device.")
+
+        return device_index
 
     @staticmethod
     def list_microphone_names():
@@ -171,7 +236,8 @@ class Microphone(AudioSource):
 
     def __enter__(self):
         assert self.stream is None, "This audio source is already inside a context manager"
-        self.audio = self.pyaudio_module.PyAudio()
+        with noalsaerr():
+            self.audio = self.pyaudio_module.PyAudio()
         try:
             self.stream = Microphone.MicrophoneStream(
                 self.audio.open(
@@ -340,6 +406,7 @@ class AudioData(object):
         self.frame_data = frame_data
         self.sample_rate = sample_rate
         self.sample_width = int(sample_width)
+        self.num_frames = 0
 
     def get_segment(self, start_ms=None, end_ms=None):
         """
@@ -423,6 +490,7 @@ class AudioData(object):
                 wav_writer.setnchannels(1)
                 wav_writer.writeframes(raw_data)
                 wav_data = wav_file.getvalue()
+                self.num_frames = wav_writer.getnframes()
             finally:  # make sure resources are cleaned up
                 wav_writer.close()
         return wav_data
@@ -494,6 +562,108 @@ class AudioData(object):
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, startupinfo=startup_info)
         flac_data, stderr = process.communicate(wav_data)
         return flac_data
+
+    def get_unpacked_data(self, wav_data=None, num_frames=None):
+        if wav_data is None or num_frames is None:
+            wav_data = self.get_wav_data()
+        return struct.unpack_from('<%dh' % self.num_frames, wav_data)
+
+    def save_wav_file(self, file_name):
+        with open("{0}.wav".format(file_name), "wb") as f:
+            f.write(self.get_wav_data()[0])
+
+    def frame_generator(self, frame_duration_ms):
+        """
+        Generates audio frames from raw audio data. Takes the desired frame duration in
+        milliseconds. Yields Frames of the requested duration.
+        """
+        n = int(self.sample_rate * (frame_duration_ms / 1000.0) * 2)
+        offset = 0
+        timestamp = 0.0
+        duration = (float(n) / self.sample_rate) / 2.0
+        while offset + n < len(self.frame_data):
+            yield Frame(self.frame_data[offset:offset + n], timestamp, duration)
+            timestamp += duration
+            offset += n
+
+    def vad_collector(sample_rate, frame_duration_ms,
+                      padding_duration_ms, vad, frames):
+        """
+    	Filters out non-voiced audio frames.
+        Given a webrtcvad.Vad and a source of audio frames, yields only
+        the voiced audio.
+        Uses a padded, sliding window algorithm over the audio frames.
+        When more than 90% of the frames in the window are voiced (as
+        reported by the VAD), the collector triggers and begins yielding
+        audio frames. Then the collector waits until 90% of the frames in
+        the window are unvoiced to detrigger.
+        The window is padded at the front and back to provide a small
+        amount of silence or the beginnings/endings of speech around the
+        voiced frames.
+        Arguments:
+        sample_rate - The audio sample rate, in Hz.
+        frame_duration_ms - The frame duration in milliseconds.
+        padding_duration_ms - The amount to pad the window, in milliseconds.
+        vad - An instance of webrtcvad.Vad.
+        frames - a source of audio frames (sequence or generator).
+        Returns: A generator that yields PCM audio data.
+        """
+        num_padding_frames = int(padding_duration_ms / frame_duration_ms)
+        # We use a deque for our sliding window/ring buffer.
+        ring_buffer = collections.deque(maxlen=num_padding_frames)
+        # We have two states: TRIGGERED and NOTTRIGGERED. We start in the
+        # NOTTRIGGERED state.
+        triggered = False
+
+        voiced_frames = []
+        for frame in frames:
+            is_speech = vad.is_speech(frame.bytes, sample_rate)
+
+            sys.stdout.write('1' if is_speech else '0')
+            if not triggered:
+                ring_buffer.append((frame, is_speech))
+                num_voiced = len([f for f, speech in ring_buffer if speech])
+                # If we're NOTTRIGGERED and more than 90% of the frames in
+                # the ring buffer are voiced frames, then enter the
+                # TRIGGERED state.
+                if num_voiced > 0.9 * ring_buffer.maxlen:
+                    triggered = True
+                    sys.stdout.write('+(%s)' % (ring_buffer[0][0].timestamp,))
+                    # We want to yield all the audio we see from now until
+                    # we are NOTTRIGGERED, but we have to start with the
+                    # audio that's already in the ring buffer.
+                    for f, s in ring_buffer:
+                        voiced_frames.append(f)
+                    ring_buffer.clear()
+            else:
+                # We're in the TRIGGERED state, so collect the audio data
+                # and add it to the ring buffer.
+                voiced_frames.append(frame)
+                ring_buffer.append((frame, is_speech))
+                num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+                # If more than 90% of the frames in the ring buffer are
+                # unvoiced, then enter NOTTRIGGERED and yield whatever
+                # audio we've collected.
+                if num_unvoiced > 0.9 * ring_buffer.maxlen:
+                    sys.stdout.write('-(%s)' % (frame.timestamp + frame.duration))
+                    triggered = False
+                    yield b''.join([f.bytes for f in voiced_frames])
+                    ring_buffer.clear()
+                    voiced_frames = []
+        if triggered:
+            sys.stdout.write('-(%s)' % (frame.timestamp + frame.duration))
+        sys.stdout.write('\n')
+        # If we have any leftover voiced audio when we run out of input,
+        # yield it.
+        if voiced_frames:
+            yield b''.join([f.bytes for f in voiced_frames])
+
+    class Frame(object):
+        """Represents a "frame" of audio data."""
+        def __init__(self, bytes, timestamp, duration):
+            self.bytes = bytes
+            self.timestamp = timestamp
+            self.duration = duration
 
 
 class Recognizer(AudioSource):
@@ -743,6 +913,76 @@ class Recognizer(AudioSource):
         listener_thread.start()
         return stopper
 
+    def load_kaldi_model(self, model_directory          = None ,
+                               language                 = 'de-DE',
+                               model_type               = 'model',
+                               acoustic_scale           = 1, # nnet3: 0.1
+                               beam                     = 7.0, # nnet3: 14.0
+                               frame_subsampling_factor = 3):  # nnet3: 1
+        """
+        The recognition language is determined by ``language``, an RFC5646 language tag like
+        ``"en-US"``, defaulting to US English. Out of the box, only ``en-US`` and ``de-DE``is
+        supported. For additional languages, go to Kaldi documentation <http://kaldi-asr.org/doc/>
+        for training new models.
+        """
+        try:
+            from kaldiasr.nnet3 import KaldiNNet3OnlineModel, KaldiNNet3OnlineDecoder
+        except ImportError:
+            raise RequestError("missing py-kaldi-asr module: ensure that it is set up correctly.")
+
+        assert isinstance(model_directory, (type(""), type(u""))) or model_directory is  None, \
+            'Use a valid directory path'
+        assert isinstance(language, (type(""), type(u""))) and len(language) == 5, \
+            'Use a RFC5646 language tag like ``"en-US"`` or ``de-DE``'
+        assert isinstance(model_type, (type(""), type(u""))), 'Invalid model type'
+        assert isinstance(acoustic_scale, int), 'The acoustic scale used in decoding'
+        assert isinstance(beam, float), 'Lattice beam'
+        assert isinstance(frame_subsampling_factor, int), 'Frame shifting factor'
+
+        if model_directory is None:
+            if language == 'en-US':
+                model_directory = '{0}/speech/py-kaldi-asr/data/models/nnet3_en' \
+                    .format(os.path.expanduser('~'))
+            elif language == 'de-DE':
+                model_directory = '{0}/speech/py-kaldi-asr/data/models/nnet3_de' \
+                    .format(os.path.expanduser('~'))
+
+        # import the PocketSphinx speech recognition module
+        try:
+            print('loading {0}...'.format(model_type))
+            self.kaldi_model = KaldiNNet3OnlineModel(model_directory,
+                                                     model_type,
+                                                     acoustic_scale = acoustic_scale,
+                                                     beam = beam,
+                                                     frame_subsampling_factor = frame_subsampling_factor)
+            print('loading {0}... done.'.format(model_type))
+            self.decoder = KaldiNNet3OnlineDecoder (self.kaldi_model)
+
+        except ImportError:
+            raise RequestError("missing py-kaldi-asr module: ensure that it is set up correctly.")
+
+
+    def recognize_kaldi(self, audio_data):
+        """
+        Performs speech recognition on ``audio_data`` (an ``AudioData`` instance), using Kaldi.
+        Returns the decoded string from Kaldi decoder.
+        """
+        try:
+            self.kaldi_model
+            self.decoder
+        except:
+            raise NameError("You should load the Kaldi model first. Try recognizer_instance.load_kaldi_model()")
+        assert isinstance(audio_data, AudioData), "``audio_data`` must be audio data"
+
+        samples = audio_data.get_unpacked_data()
+
+        try:
+            if self.decoder.decode(audio_data.sample_rate, np.array(samples, dtype=np.float32), True):
+                s = self.decoder.get_decoded_string()
+                return s
+        except:
+            raise BaseException("Could not decode audio")
+
     def recognize_sphinx(self, audio_data, language="en-US", keyword_entries=None, grammar=None, show_all=False):
         """
         Performs speech recognition on ``audio_data`` (an ``AudioData`` instance), using CMU Sphinx.
@@ -851,9 +1091,9 @@ class Recognizer(AudioSource):
         To obtain your own API key, simply following the steps on the `API Keys <http://www.chromium.org/developers/how-tos/api-keys>`__ page at the Chromium Developers site. In the Google Developers Console, Google Speech Recognition is listed as "Speech API".
 
         The recognition language is determined by ``language``, an RFC5646 language tag like ``"en-US"`` (US English) or ``"fr-FR"`` (International French), defaulting to US English. A list of supported language tags can be found in this `StackOverflow answer <http://stackoverflow.com/a/14302134>`__.
-        
+
         The profanity filter level can be adjusted with ``pfilter``: 0 - No filter, 1 - Only shows the first character and replaces the rest with asterisks. The default is level 0.
-        
+
         Returns the most likely transcription if ``show_all`` is false (the default). Otherwise, returns the raw API response as a JSON dictionary.
 
         Raises a ``speech_recognition.UnknownValueError`` exception if the speech is unintelligible. Raises a ``speech_recognition.RequestError`` exception if the speech recognition operation failed, if the key isn't valid, or if there is no internet connection.
@@ -1378,7 +1618,7 @@ WavFile = AudioFile  # WavFile was renamed to AudioFile in 3.4.1
 
 
 def recognize_api(self, audio_data, client_access_token, language="en", session_id=None, show_all=False):
-    wav_data = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
+    wav_data  = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
     url = "https://api.api.ai/v1/query"
     while True:
         boundary = uuid.uuid4().hex
